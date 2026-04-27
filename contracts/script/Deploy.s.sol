@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Script.sol";
-import "../src/FillerBot.sol";
+import "../FillerBot.sol";
 
 /// @notice Deploys FillerBot to Ethereum Mainnet.
 ///
