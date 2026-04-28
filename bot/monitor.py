@@ -26,25 +26,27 @@ def log(msg: str):
 
 
 def fetch_open_orders() -> list:
-    """Fetch open Dutch V2 orders from UniswapX API."""
-    try:
-        r = requests.get(
-            UNISWAPX_API,
-            params={
-                "orderStatus": "open",
-                "chainId":     1,
-                "limit":       ORDER_LIMIT,
-                "orderType":   "Dutch_V2",
-            },
-            timeout=10,
-        )
-        if r.status_code != 200:
-            log(f"  API {r.status_code}: {r.text[:80]}")
-            return []
-        return r.json().get("orders", [])
-    except Exception as e:
-        log(f"  fetch error: {e}")
-        return []
+    """Fetch open orders from UniswapX API across all supported order types."""
+    orders = []
+    for order_type in ("Dutch_V2", "Limit"):
+        try:
+            r = requests.get(
+                UNISWAPX_API,
+                params={
+                    "orderStatus": "open",
+                    "chainId":     1,
+                    "limit":       ORDER_LIMIT,
+                    "orderType":   order_type,
+                },
+                timeout=10,
+            )
+            if r.status_code != 200:
+                log(f"  API {r.status_code} ({order_type}): {r.text[:80]}")
+                continue
+            orders.extend(r.json().get("orders", []))
+        except Exception as e:
+            log(f"  fetch error ({order_type}): {e}")
+    return orders
 
 
 def evaluate_batch(w3: Web3, orders: list) -> list[dict]:
@@ -52,11 +54,10 @@ def evaluate_batch(w3: Web3, orders: list) -> list[dict]:
     Evaluate all orders concurrently.
     Returns list of profitable fill-param dicts.
     """
-    profitable = []
+    if not orders:
+        return []
 
-    # Each order evaluation fires 3 QuoterV2 calls internally (one per fee tier)
-    # and up to 2 more for USD pricing — running them all in parallel cuts
-    # wall time from N*5 sequential RPC calls to ~5 regardless of order count.
+    profitable = []
     with ThreadPoolExecutor(max_workers=min(len(orders), 20)) as ex:
         futures = {ex.submit(evaluate, w3, o): o for o in orders}
         for fut in as_completed(futures):
@@ -67,25 +68,17 @@ def evaluate_batch(w3: Web3, orders: list) -> list[dict]:
     return profitable
 
 
-def main():
-    if not EXECUTOR_KEY:
-        log("ERROR: EXECUTOR_PRIVATE_KEY not set")
-        return
-    if not FILLERBOT_ADDR:
-        log("ERROR: FILLERBOT_ADDRESS not set")
-        return
+def run_loop(w3: Web3, fill_fn=None):
+    """
+    Main polling loop. Runs forever until KeyboardInterrupt.
 
-    log("=" * 55)
-    log("UniswapX FillerBot")
-    log(f"  IPC:      {IPC_PATH}")
-    log(f"  Contract: {FILLERBOT_ADDR}")
-    log(f"  Poll:     every {POLL_INTERVAL}s")
-    log("=" * 55)
-
-    w3 = Web3(Web3.IPCProvider(IPC_PATH))
-    if not w3.is_connected():
-        log(f"ERROR: cannot connect to {IPC_PATH}")
-        return
+    Args:
+        w3:      Connected Web3 instance (IPC for prod, HTTP for fork).
+        fill_fn: Optional override for execute_fill — used by fork_test to
+                 redirect execution to anvil. Defaults to the real execute_fill.
+    """
+    if fill_fn is None:
+        fill_fn = execute_fill
 
     log(f"Node connected — block {w3.eth.block_number:,}")
     log("Watching for orders...")
@@ -102,7 +95,7 @@ def main():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Filter already-seen orders
+            # Filter already-seen order hashes
             new_orders = [o for o in orders
                           if o.get("orderHash", "") not in seen]
             for o in orders:
@@ -131,7 +124,7 @@ def main():
                     f" gas=${fill['gas_cost_usd']:.4f}"
                     f" fee={fill['pool_fee']}")
                 try:
-                    tx_hash = execute_fill(w3, fill)
+                    tx_hash = fill_fn(w3, fill)
                     log(f"    tx: {tx_hash}")
                     receipt = wait_for_receipt(w3, tx_hash, timeout=60)
                     if receipt and receipt["status"] == 1:
@@ -157,6 +150,29 @@ def main():
             log(f"Loop error: {e}")
 
         time.sleep(POLL_INTERVAL)
+
+
+def main():
+    if not EXECUTOR_KEY:
+        log("ERROR: EXECUTOR_PRIVATE_KEY not set")
+        return
+    if not FILLERBOT_ADDR:
+        log("ERROR: FILLERBOT_ADDRESS not set")
+        return
+
+    log("=" * 55)
+    log("UniswapX FillerBot")
+    log(f"  IPC:      {IPC_PATH}")
+    log(f"  Contract: {FILLERBOT_ADDR}")
+    log(f"  Poll:     every {POLL_INTERVAL}s")
+    log("=" * 55)
+
+    w3 = Web3(Web3.IPCProvider(IPC_PATH))
+    if not w3.is_connected():
+        log(f"ERROR: cannot connect to {IPC_PATH}")
+        return
+
+    run_loop(w3)
 
 
 if __name__ == "__main__":

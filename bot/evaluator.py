@@ -266,7 +266,7 @@ def evaluate(w3: Web3, order: dict) -> dict | None:
         # ── Required output ───────────────────────────────────────────────────
         required_out, token_out = current_required_out(order)
         if token_out == ETH_ADDR:
-            return None
+            token_out = WETH
         if required_out == 0:
             return None
 
