@@ -53,6 +53,8 @@ def execute_fill(w3: Web3, fill: dict) -> str:
     if not FILLERBOT_ADDR:
         raise ValueError("FILLERBOT_ADDRESS not set")
 
+    order_hash = fill.get("order_hash", "?")
+
     account  = Account.from_key(EXECUTOR_KEY)
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(FILLERBOT_ADDR),
@@ -71,20 +73,20 @@ def execute_fill(w3: Web3, fill: dict) -> str:
     )
 
     # ── EIP-1559 fee model ────────────────────────────────────────────────────
-    # Get latest block to read baseFee
     latest       = w3.eth.get_block("latest")
-    base_fee     = latest["baseFeePerGas"]           # current base fee in wei
-
-    # Priority fee (tip) — 1 gwei is enough for a filler bot, adjust if needed
-    priority_fee = w3.eth.max_priority_fee            # node's suggested tip
-
-    # maxFeePerGas = 2x baseFee + tip (covers 1 full base fee doubling)
+    base_fee     = latest["baseFeePerGas"]
+    priority_fee = w3.eth.max_priority_fee
     max_fee      = (2 * base_fee) + priority_fee
 
     # ── Exact gas estimate from node ──────────────────────────────────────────
-    gas_limit = contract.functions.fillOrder(*call_args).estimate_gas({
-        "from": account.address,
-    })
+    try:
+        gas_limit = contract.functions.fillOrder(*call_args).estimate_gas({
+            "from": account.address,
+        })
+    except Exception as e:
+        raise RuntimeError(
+            f"estimate_gas failed order={order_hash}: {e}"
+        ) from e
 
     nonce = w3.eth.get_transaction_count(account.address)
 

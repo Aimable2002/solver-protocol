@@ -119,7 +119,7 @@ def run_loop(w3: Web3, fill_fn=None, verbose: bool = False):
 
             # Execute fillable orders sorted by surplus desc
             for fill in sorted(profitable, key=lambda x: -x["surplus_raw"]):
-                log(f"  FILL {fill['token_in'][:10]}->{fill['token_out'][:10]}"
+                log(f"  FILL {fill['token_in'][:10]}->{fill['token_out'][:10]} order={fill['order_hash']}"
                     f" surplus_raw={fill['surplus_raw']}"
                     f" v3_quote={fill['v3_quote']}"
                     f" required_out={fill['required_out']}"
