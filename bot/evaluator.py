@@ -33,10 +33,6 @@ def account_address() -> str:
     return Account.from_key(EXECUTOR_KEY).address
 
 
-def _vlog(verbose: bool, msg: str):
-    if verbose:
-        print(f"  {msg}", flush=True)
-
 
 # ── ABIs ──────────────────────────────────────────────────────────────────────
 QUOTER_ABI = [{
@@ -208,8 +204,9 @@ def token_to_usd(w3: Web3, token: str, amount_raw: int, dec: int) -> float:
     token = token.lower()
     amount_h = amount_raw / (10 ** dec)
 
-    # Stablecoins are $1
-    if token in STABLES:
+    # Stablecoins are $1 — normalize to lowercase at comparison time so
+    # mixed-case addresses from the API never cause a miss
+    if token in {s.lower() for s in STABLES}:
         return amount_h
 
     # WETH — price via WETH/USDC pool
@@ -320,15 +317,11 @@ def evaluate(w3: Web3, order: dict, verbose: bool = False) -> dict | None:
 
     ETH_ADDR = "0x0000000000000000000000000000000000000000"
 
-    def skip(reason: str):
-        _vlog(verbose, f"SKIP [{reason}]")
-        return None
-
     try:
         # ── Deadline ─────────────────────────────────────────────────────────
         deadline = int(order.get("deadline") or 0)
         if deadline and time.time() >= deadline:
-            return skip("expired")
+            return None
 
         # ── Exclusivity ───────────────────────────────────────────────────────
         cosigner_data    = order.get("cosignerData", {})
@@ -336,33 +329,46 @@ def evaluate(w3: Web3, order: dict, verbose: bool = False) -> dict | None:
         decay_start      = int(cosigner_data.get("decayStartTime")
                                or order.get("decayStartTime") or 0)
         if exclusive_filler not in ("", ETH_ADDR) and time.time() < decay_start:
-            return skip(f"exclusive until {decay_start - int(time.time())}s")
+            return None
 
         # ── Token in ──────────────────────────────────────────────────────────
         token_in = order.get("input", {}).get("token", "").lower()
         if not token_in:
-            return skip("no token_in")
+            return None
 
         # ── Required output ───────────────────────────────────────────────────
         required_out, token_out = current_required_out(order)
         if token_out == ETH_ADDR:
-            return skip("ETH output (contract ERC20-only)")
+            return None
         if required_out == 0:
-            return skip("required_out=0")
+            return None
 
         # ── Amount in ─────────────────────────────────────────────────────────
         input_override = cosigner_data.get("inputOverride", "0") or "0"
         amount_in = (int(input_override) if input_override != "0"
                      else int(order.get("input", {}).get("startAmount", 0)))
         if amount_in == 0:
-            return skip("amount_in=0")
+            return None
 
-        # ── Verbose header — printed after basic validation ───────────────────
+        # ── Decimals needed for quote comparison ─────────────────────────────
+        dec_out = get_decimals(w3, token_out)
+
+        # ── V3 quote — silent, no logging yet ────────────────────────────────
+        # We don't print anything until the quote beats required_out.
+        # Orders with no liquidity or garbage required amounts are silent.
+        v3_quote, pool_fee = quote_best(w3, token_in, token_out, amount_in)
+
+        if v3_quote == 0 or pool_fee == 0:
+            return None  # silent — no liquidity, not interesting
+
+        if v3_quote <= required_out:
+            return None  # silent — unprofitable at current market, not interesting
+
+        # ── Quote beats required — this order is worth logging ────────────────
         if verbose:
             sym_in  = get_symbol(w3, token_in)
             sym_out = get_symbol(w3, token_out)
             dec_in  = get_decimals(w3, token_in)
-            dec_out = get_decimals(w3, token_out)
             print(f"\n{datetime.now().strftime('%H:%M:%S')} "
                   f"order={order_hash} type={order_type} "
                   f"{sym_in}->{sym_out}", flush=True)
@@ -370,28 +376,9 @@ def evaluate(w3: Web3, order: dict, verbose: bool = False) -> dict | None:
                   flush=True)
             print(f"    required_out: {required_out / 10**dec_out:.6f} {sym_out}",
                   flush=True)
-        else:
-            dec_out = get_decimals(w3, token_out)
-
-        # ── V3 quote ─────────────────────────────────────────────────────────
-        if verbose:
-            v3_quote, pool_fee = quote_best_verbose(
-                w3, token_in, token_out, amount_in,
-                sym_in, sym_out, dec_in, dec_out
-            )
-        else:
-            v3_quote, pool_fee = quote_best(w3, token_in, token_out, amount_in)
-
-        if v3_quote == 0 or pool_fee == 0:
-            return skip("no V3 liquidity across all fee tiers")
-
-        if v3_quote <= required_out:
-            if verbose:
-                gap = (required_out - v3_quote) / 10**dec_out
-                print(f"    quote {v3_quote/10**dec_out:.6f} <= required "
-                      f"{required_out/10**dec_out:.6f} "
-                      f"(short by {gap:.6f} {sym_out})", flush=True)
-            return skip("V3 quote below required output")
+            # Re-run verbose quote to show per-tier breakdown
+            quote_best_verbose(w3, token_in, token_out, amount_in,
+                               sym_in, sym_out, dec_in, dec_out)
 
         # ── Surplus ───────────────────────────────────────────────────────────
         surplus_raw = v3_quote - required_out
@@ -445,7 +432,10 @@ def evaluate(w3: Web3, order: dict, verbose: bool = False) -> dict | None:
                   f"(min=${MIN_PROFIT_USD})", flush=True)
 
         if profit_usd < MIN_PROFIT_USD:
-            return skip(f"profit ${profit_usd:.4f} < min ${MIN_PROFIT_USD}")
+            if verbose:
+                print(f"    SKIP profit ${profit_usd:.4f} < min ${MIN_PROFIT_USD}",
+                      flush=True)
+            return None
 
         if verbose:
             print(f"    ✓ PROFITABLE", flush=True)
@@ -466,5 +456,7 @@ def evaluate(w3: Web3, order: dict, verbose: bool = False) -> dict | None:
         }
 
     except Exception as e:
-        _vlog(verbose, f"EXCEPTION: {e}")
+        if verbose:
+            print(f"\n{datetime.now().strftime('%H:%M:%S')} "
+                  f"order={order_hash} EXCEPTION: {e}", flush=True)
         return None
