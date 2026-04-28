@@ -222,15 +222,20 @@ def token_to_usd(w3: Web3, token: str, amount_raw: int, dec: int) -> float:
         return usdc_out / 1e6
 
     # Fallback: token → WETH → USDC (2-hop)
+    # Price token in WETH using the actual amount, then convert WETH→USD
+    # using 1 WETH as reference to avoid slippage on large weth_out amounts
     weth_out, _ = quote_best(w3, token, WETH, amount_raw)
     if weth_out == 0:
         raise ValueError(f"Cannot price token {token[:10]} — no V3 pool found")
 
-    usdc_out, _ = quote_best(w3, WETH, USDC, weth_out)
-    if usdc_out == 0:
+    # Get ETH price via 1 WETH → USDC (reference amount avoids pool depth issues)
+    one_weth_usdc, _ = quote_best(w3, WETH, USDC, 10**18)
+    if one_weth_usdc == 0:
         raise ValueError(f"Cannot price WETH→USDC for token {token[:10]}")
 
-    return usdc_out / 1e6
+    eth_price_usd = one_weth_usdc / 1e6
+    weth_amount_h = weth_out / 1e18
+    return weth_amount_h * eth_price_usd
 
 
 def get_gas_price_usd(w3: Web3, gas_units: int) -> float:
@@ -382,7 +387,10 @@ def evaluate(w3: Web3, order: dict, verbose: bool = False) -> dict | None:
 
         # ── Surplus ───────────────────────────────────────────────────────────
         surplus_raw = v3_quote - required_out
-        surplus_usd = token_to_usd(w3, token_out, surplus_raw, dec_out)
+        try:
+            surplus_usd = token_to_usd(w3, token_out, surplus_raw, dec_out)
+        except ValueError:
+            return None  # surplus token unpriceable — skip silently
 
         if verbose:
             print(f"    surplus:      {surplus_raw/10**dec_out:.6f} {sym_out}"
