@@ -62,8 +62,8 @@ def main():
     log(f"Executor: {account.address}")
     fund_executor(w3, account.address)
 
-    # Run the exact same production loop — no fork-specific logic below this line
-    run_loop(w3)
+    # Run the exact same production loop — verbose=True so every order shows full math
+    run_loop(w3, verbose=True)
 
 
 if __name__ == "__main__":

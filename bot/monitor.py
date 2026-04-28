@@ -49,17 +49,25 @@ def fetch_open_orders() -> list:
     return orders
 
 
-def evaluate_batch(w3: Web3, orders: list) -> list[dict]:
+def evaluate_batch(w3: Web3, orders: list, verbose: bool = False) -> list[dict]:
     """
     Evaluate all orders concurrently.
     Returns list of profitable fill-param dicts.
+
+    Args:
+        verbose: Passed through to evaluate(). When True each order prints
+                 full math. Fork mode sets this True; production leaves it False.
+                 Note: verbose mode runs sequentially (max_workers=1) so output
+                 lines don't interleave across concurrent threads.
     """
     if not orders:
         return []
 
     profitable = []
-    with ThreadPoolExecutor(max_workers=min(len(orders), 20)) as ex:
-        futures = {ex.submit(evaluate, w3, o): o for o in orders}
+    # Sequential in verbose mode so per-order output doesn't interleave
+    workers = 1 if verbose else min(len(orders), 20)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(evaluate, w3, o, verbose): o for o in orders}
         for fut in as_completed(futures):
             result = fut.result()
             if result is not None:
@@ -68,7 +76,7 @@ def evaluate_batch(w3: Web3, orders: list) -> list[dict]:
     return profitable
 
 
-def run_loop(w3: Web3, fill_fn=None):
+def run_loop(w3: Web3, fill_fn=None, verbose: bool = False):
     """
     Main polling loop. Runs forever until KeyboardInterrupt.
 
@@ -76,6 +84,8 @@ def run_loop(w3: Web3, fill_fn=None):
         w3:      Connected Web3 instance (IPC for prod, HTTP for fork).
         fill_fn: Optional override for execute_fill — used by fork_test to
                  redirect execution to anvil. Defaults to the real execute_fill.
+        verbose: If True, prints full math breakdown for every order evaluated.
+                 Fork mode passes True. Production leaves it False.
     """
     if fill_fn is None:
         fill_fn = execute_fill
@@ -109,7 +119,7 @@ def run_loop(w3: Web3, fill_fn=None):
 
             # Evaluate all new orders concurrently
             t0          = time.time()
-            profitable  = evaluate_batch(w3, new_orders)
+            profitable  = evaluate_batch(w3, new_orders, verbose=verbose)
             eval_ms     = int((time.time() - t0) * 1000)
             skip_count += len(new_orders) - len(profitable)
 
