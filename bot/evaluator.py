@@ -389,8 +389,10 @@ def evaluate(w3: Web3, order: dict, verbose: bool = False) -> dict | None:
         surplus_raw = v3_quote - required_out
         try:
             surplus_usd = token_to_usd(w3, token_out, surplus_raw, dec_out)
-        except ValueError:
-            return None  # surplus token unpriceable — skip silently
+        except ValueError as e:
+            if verbose:
+                print(f"    SKIP cannot price surplus: {e}", flush=True)
+            return None
 
         if verbose:
             print(f"    surplus:      {surplus_raw/10**dec_out:.6f} {sym_out}"
@@ -412,19 +414,24 @@ def evaluate(w3: Web3, order: dict, verbose: bool = False) -> dict | None:
             "name": "fillOrder", "outputs": [],
             "stateMutability": "nonpayable", "type": "function"}]
 
-        contract  = w3.eth.contract(
+        contract = w3.eth.contract(
             address=Web3.to_checksum_address(FILLERBOT_ADDR),
             abi=FILLERBOT_ABI_MIN
         )
-        gas_units = contract.functions.fillOrder(
-            bytes.fromhex(order.get("encodedOrder", "").replace("0x", "")),
-            bytes.fromhex(order.get("signature", "").replace("0x", "")),
-            Web3.to_checksum_address(token_in),
-            Web3.to_checksum_address(token_out),
-            amount_in,
-            required_out,
-            pool_fee,
-        ).estimate_gas({"from": account_address()})
+        try:
+            gas_units = contract.functions.fillOrder(
+                bytes.fromhex(order.get("encodedOrder", "").replace("0x", "")),
+                bytes.fromhex(order.get("signature", "").replace("0x", "")),
+                Web3.to_checksum_address(token_in),
+                Web3.to_checksum_address(token_out),
+                amount_in,
+                required_out,
+                pool_fee,
+            ).estimate_gas({"from": account_address()})
+        except Exception as e:
+            if verbose:
+                print(f"    SKIP gas estimation failed: {e}", flush=True)
+            return None
 
         gas_cost_usd = get_gas_price_usd(w3, gas_units)
 
