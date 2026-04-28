@@ -1,392 +1,346 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# evaluator.py — profitability check before execution
+# evaluator.py
 #
-# HOW PROFIT WORKS (no flash loan):
-# ══════════════════════════════════════════════════════════════════════
-# The reactor gives us tokenIn BEFORE the swap.
-# We swap tokenIn → tokenOut on Uniswap V3.
-# We give the user exactly `requiredOut` of tokenOut.
-# We keep the surplus as profit.
-#
-# profit = V3_quote(tokenIn, tokenOut, amountIn) - requiredOut - gas_cost
-#
-# If profit > MIN_PROFIT_USD → fill it
-#
-# DESIGN RULES:
-# ══════════════════════════════════════════════════════════════════════
-# 1. No hardcoded price/gas fallbacks — if QuoterV2 or gas_price fails,
-#    raise QuoteError and skip the order. Never guess.
-# 2. No token whitelist — any ERC20 token in an order gets evaluated.
-#    Decimals are fetched on-chain if not in the local cache.
-# 3. quote_v3 and get_decimals are plain blocking calls designed to be
-#    driven from a ThreadPoolExecutor in monitor.py so many orders are
-#    evaluated concurrently.
+# DESIGN:
+#   - No hardcoded fallbacks anywhere. If we can't get a real value, we raise
+#     and the order is skipped. Never guess.
+#   - All tokens supported — no whitelist. Any token the order uses gets quoted.
+#   - Concurrent — quote_all_fees() fires all 3 fee tiers in parallel threads.
+#   - USD pricing uses on-chain QuoterV2 only, never CoinGecko or hardcodes.
+#     surplus token → WETH → USDC gives a 2-hop price for any token.
 # ─────────────────────────────────────────────────────────────────────────────
-import threading
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from web3 import Web3
+
+from eth_account import Account
 from config import (
     QUOTER_V2, FEE_TIERS, MIN_PROFIT_USD,
-    GAS_ESTIMATE, DECIMALS
+    DECIMALS, STABLES, EXECUTOR_KEY,
+    WETH, USDC, WBTC
 )
 
-# Thread-safe lock for the shared DECIMALS cache
-_decimals_lock = threading.Lock()
-
-
-# ── Custom exceptions ─────────────────────────────────────────────────────────
-
-class QuoteError(Exception):
-    """Raised when QuoterV2 cannot return a usable quote."""
-
-class GasPriceError(Exception):
-    """Raised when the node cannot return the current gas price."""
-
-class DecimalsError(Exception):
-    """Raised when token decimals cannot be determined."""
-
+def account_address() -> str:
+    """Return executor wallet address for gas estimation calls."""
+    return Account.from_key(EXECUTOR_KEY).address
 
 # ── ABIs ──────────────────────────────────────────────────────────────────────
-
-QUOTER_ABI = [
-    {
-        "inputs": [{
-            "components": [
-                {"name": "tokenIn",             "type": "address"},
-                {"name": "tokenOut",            "type": "address"},
-                {"name": "amountIn",            "type": "uint256"},
-                {"name": "fee",                 "type": "uint24"},
-                {"name": "sqrtPriceLimitX96",   "type": "uint160"},
-            ],
-            "name": "params",
-            "type": "tuple"
-        }],
-        "name": "quoteExactInputSingle",
-        "outputs": [
-            {"name": "amountOut",               "type": "uint256"},
-            {"name": "sqrtPriceX96After",        "type": "uint160"},
-            {"name": "initializedTicksCrossed",  "type": "uint32"},
-            {"name": "gasEstimate",              "type": "uint256"},
-        ],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    }
-]
+QUOTER_ABI = [{
+    "inputs": [{"components": [
+        {"name": "tokenIn",           "type": "address"},
+        {"name": "tokenOut",          "type": "address"},
+        {"name": "amountIn",          "type": "uint256"},
+        {"name": "fee",               "type": "uint24"},
+        {"name": "sqrtPriceLimitX96", "type": "uint160"},
+    ], "name": "params", "type": "tuple"}],
+    "name": "quoteExactInputSingle",
+    "outputs": [
+        {"name": "amountOut",              "type": "uint256"},
+        {"name": "sqrtPriceX96After",      "type": "uint160"},
+        {"name": "initializedTicksCrossed","type": "uint32"},
+        {"name": "gasEstimate",            "type": "uint256"},
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function",
+}]
 
 ERC20_ABI = [
-    {
-        "inputs": [],
-        "name": "decimals",
-        "outputs": [{"type": "uint8"}],
-        "stateMutability": "view",
-        "type": "function"
-    }
+    {"inputs": [], "name": "decimals",
+     "outputs": [{"type": "uint8"}],
+     "stateMutability": "view", "type": "function"},
 ]
 
+# ── Decimals cache lock (shared across threads) ───────────────────────────────
+_dec_lock = threading.Lock()
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_decimals(w3: Web3, token: str) -> int:
     """
-    Return token decimals.
-
-    Checks the local cache first (thread-safe read).
-    If not cached, calls decimals() on-chain and populates the cache.
-
-    Raises DecimalsError if the on-chain call fails — callers must catch
-    this and skip the order rather than guessing.
+    Fetch token decimals. Uses cache, falls back to on-chain call.
+    Raises if on-chain call fails — never returns a guess.
     """
     token = token.lower()
-
-    with _decimals_lock:
+    with _dec_lock:
         if token in DECIMALS:
             return DECIMALS[token]
 
-    # On-chain fetch (outside the lock — only one thread wastes a call at worst)
-    try:
-        contract = w3.eth.contract(
-            address=Web3.to_checksum_address(token),
-            abi=ERC20_ABI
-        )
-        dec = contract.functions.decimals().call()
-    except Exception as exc:
-        raise DecimalsError(f"cannot fetch decimals for {token}: {exc}") from exc
+    c = w3.eth.contract(
+        address=Web3.to_checksum_address(token),
+        abi=ERC20_ABI
+    )
+    dec = c.functions.decimals().call()   # raises on failure — intentional
 
-    with _decimals_lock:
+    with _dec_lock:
         DECIMALS[token] = dec
-
     return dec
 
 
-def get_gas_price(w3: Web3) -> int:
+def _quote_single(w3: Web3, token_in: str, token_out: str,
+                  amount_in: int, fee: int) -> int:
     """
-    Return current gas price in wei from the node.
-
-    Raises GasPriceError if the node call fails.
-    Never falls back to a hardcoded value.
+    Call QuoterV2.quoteExactInputSingle via eth_call (simulation, no gas cost).
+    Returns amountOut or 0 if the pool does not exist / reverts.
     """
-    try:
-        return w3.eth.gas_price
-    except Exception as exc:
-        raise GasPriceError(f"cannot fetch gas price: {exc}") from exc
-
-
-def get_eth_price_usd(w3: Web3) -> float:
-    """
-    Get ETH price in USD using the USDC/WETH 0.05% pool.
-
-    Raises QuoteError if the quote fails — the caller (monitor.py) should
-    decide whether to retry or abort the poll cycle.
-    """
-    WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-    USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-
     quoter = w3.eth.contract(
         address=Web3.to_checksum_address(QUOTER_V2),
         abi=QUOTER_ABI
     )
     try:
         result = quoter.functions.quoteExactInputSingle({
-            "tokenIn":           Web3.to_checksum_address(WETH),
-            "tokenOut":          Web3.to_checksum_address(USDC),
-            "amountIn":          10**18,
-            "fee":               500,
+            "tokenIn":           Web3.to_checksum_address(token_in),
+            "tokenOut":          Web3.to_checksum_address(token_out),
+            "amountIn":          amount_in,
+            "fee":               fee,
             "sqrtPriceLimitX96": 0,
         }).call()
-    except Exception as exc:
-        raise QuoteError(f"ETH/USDC quote failed: {exc}") from exc
-
-    price = result[0] / 1e6   # USDC has 6 decimals
-    if price <= 0:
-        raise QuoteError(f"ETH/USDC quote returned non-positive price: {price}")
-    return price
+        return result[0]  # amountOut
+    except Exception:
+        return 0  # pool doesn't exist or no liquidity at this fee tier
 
 
-def quote_v3(
-    w3: Web3,
-    token_in: str,
-    token_out: str,
-    amount_in: int,
-) -> tuple[int, int]:
+def quote_best(w3: Web3, token_in: str, token_out: str,
+               amount_in: int) -> tuple[int, int]:
     """
-    Get best V3 quote across all fee tiers.
-
+    Quote across all fee tiers concurrently.
     Returns (best_amount_out, best_fee_tier).
-
-    Raises QuoteError if every fee tier fails (no pool exists or all
-    calls error). Callers must catch this and skip the order.
+    Returns (0, 0) if no pool found.
     """
-    quoter = w3.eth.contract(
-        address=Web3.to_checksum_address(QUOTER_V2),
-        abi=QUOTER_ABI
-    )
-    best_out  = 0
-    best_fee  = 0
-    errors    = []
+    best_out = 0
+    best_fee = 0
 
-    for fee in FEE_TIERS:
-        try:
-            result = quoter.functions.quoteExactInputSingle({
-                "tokenIn":           Web3.to_checksum_address(token_in),
-                "tokenOut":          Web3.to_checksum_address(token_out),
-                "amountIn":          amount_in,
-                "fee":               fee,
-                "sqrtPriceLimitX96": 0,
-            }).call()
-            amount_out = result[0]
-            if amount_out > best_out:
-                best_out = amount_out
-                best_fee = fee
-        except Exception as exc:
-            errors.append(f"fee={fee}: {exc}")
-            continue  # this pool doesn't exist or reverted — try next tier
-
-    if best_out == 0 or best_fee == 0:
-        raise QuoteError(
-            f"no V3 quote for {token_in}->{token_out} "
-            f"amount={amount_in}. Errors: {errors}"
-        )
+    with ThreadPoolExecutor(max_workers=len(FEE_TIERS)) as ex:
+        futures = {
+            ex.submit(_quote_single, w3, token_in, token_out, amount_in, fee): fee
+            for fee in FEE_TIERS
+        }
+        for fut in as_completed(futures):
+            fee = futures[fut]
+            try:
+                out = fut.result()
+                if out > best_out:
+                    best_out = out
+                    best_fee = fee
+            except Exception:
+                pass
 
     return best_out, best_fee
 
 
-# ── Dutch V2 decay ────────────────────────────────────────────────────────────
-
-def current_required_out(order: dict) -> int:
+def token_to_usd(w3: Web3, token: str, amount_raw: int, dec: int) -> float:
     """
-    Calculate the current decayed minimum output amount for a Dutch V2 order.
+    Convert any token amount to USD using on-chain quotes only.
+    Route: token → USDC (direct) OR token → WETH → USDC (2-hop).
+    Raises if neither route can produce a quote.
+    """
+    token = token.lower()
+    amount_h = amount_raw / (10 ** dec)
 
-    Uses cosignerData for decay times and output overrides.
-    Filters out fee outputs (isFeeOutput=True).
-    Returns 0 if the order has no usable primary output.
+    # Stablecoins are $1
+    if token in STABLES:
+        return amount_h
+
+    # WETH — price via WETH/USDC pool
+    if token == WETH:
+        usdc_out, _ = quote_best(w3, WETH, USDC, amount_raw)
+        if usdc_out == 0:
+            raise ValueError(f"Cannot price WETH→USDC")
+        return usdc_out / 1e6
+
+    # Try direct token → USDC first
+    usdc_out, _ = quote_best(w3, token, USDC, amount_raw)
+    if usdc_out > 0:
+        return usdc_out / 1e6
+
+    # Fallback: token → WETH → USDC (2-hop)
+    weth_out, _ = quote_best(w3, token, WETH, amount_raw)
+    if weth_out == 0:
+        raise ValueError(f"Cannot price token {token[:10]} — no V3 pool found")
+
+    usdc_out, _ = quote_best(w3, WETH, USDC, weth_out)
+    if usdc_out == 0:
+        raise ValueError(f"Cannot price WETH→USDC for token {token[:10]}")
+
+    return usdc_out / 1e6
+
+
+def get_gas_price_usd(w3: Web3, gas_units: int) -> float:
+    """
+    Estimate gas cost in USD for a given number of gas units.
+    Uses EIP-1559 baseFee from latest block (not legacy gasPrice).
+    ETH price sourced from QuoterV2 on-chain — no hardcodes.
+    Raises if either call fails.
+    """
+    latest   = w3.eth.get_block("latest")
+    base_fee = latest["baseFeePerGas"]           # wei — actual current cost
+    tip      = w3.eth.max_priority_fee            # wei — node suggested tip
+    gas_eth  = (gas_units * (base_fee + tip)) / 1e18
+
+    # ETH price via QuoterV2 — 1 WETH → USDC
+    usdc_out, _ = quote_best(w3, WETH, USDC, 10**18)
+    if usdc_out == 0:
+        raise ValueError("Cannot get ETH price — WETH/USDC pool returned 0")
+
+    eth_price = usdc_out / 1e6
+    return gas_eth * eth_price
+
+
+def current_required_out(order: dict) -> tuple[int, str]:
+    """
+    Calculate current decayed minimum output and token address.
+    Handles Dutch V1 (top-level decay times) and V2 (cosignerData).
+    Filters out fee outputs.
+    Returns (required_out_raw, token_out_address).
+    Raises if order structure is invalid.
     """
     now = int(time.time())
 
     cosigner_data    = order.get("cosignerData", {})
-    decay_start      = cosigner_data.get("decayStartTime") or order.get("decayStartTime", 0)
-    decay_end        = cosigner_data.get("decayEndTime")   or order.get("decayEndTime", 0)
+    decay_start      = int(cosigner_data.get("decayStartTime")
+                           or order.get("decayStartTime") or 0)
+    decay_end        = int(cosigner_data.get("decayEndTime")
+                           or order.get("decayEndTime") or 0)
     output_overrides = cosigner_data.get("outputOverrides", [])
 
-    outputs = [o for o in order.get("outputs", []) if not o.get("isFeeOutput", False)]
+    # Filter fee outputs
+    outputs = [o for o in order.get("outputs", [])
+               if not o.get("isFeeOutput", False)]
     if not outputs:
-        return 0
+        raise ValueError("Order has no non-fee outputs")
 
-    primary      = max(outputs, key=lambda x: int(x.get("endAmount", 0)))
+    # Pick primary output (largest endAmount)
+    primary = max(outputs, key=lambda x: int(x.get("endAmount", 0)))
+    token_out    = primary.get("token", "").lower()
     start_amount = int(primary.get("startAmount", 0))
     end_amount   = int(primary.get("endAmount", 0))
 
-    # Apply cosigner override if provided
-    if output_overrides:
-        idx = outputs.index(primary)
-        if idx < len(output_overrides) and output_overrides[idx] != "0":
-            start_amount = int(output_overrides[idx])
+    if not token_out or start_amount == 0:
+        raise ValueError("Invalid output token or zero startAmount")
 
+    # Apply cosigner outputOverride if present
+    idx = outputs.index(primary)
+    if idx < len(output_overrides) and output_overrides[idx] not in ("0", "", None):
+        start_amount = int(output_overrides[idx])
+
+    # Decay calculation
+    if decay_end == 0 or now >= decay_end:
+        return end_amount, token_out
     if now <= decay_start:
-        return start_amount
-    if now >= decay_end or decay_end == 0:
-        return end_amount
+        return start_amount, token_out
 
     elapsed  = now - decay_start
     duration = decay_end - decay_start
     decay    = (start_amount - end_amount) * elapsed // duration
-    return start_amount - decay
+    return start_amount - decay, token_out
 
 
-# ── Main evaluator ────────────────────────────────────────────────────────────
-
-def evaluate(w3: Web3, order: dict, eth_price: float) -> dict | None:
+def evaluate(w3: Web3, order: dict) -> dict | None:
     """
-    Evaluate whether an order is profitable to fill.
-
-    Designed to be called from a ThreadPoolExecutor — all blocking I/O
-    (QuoterV2, gas price, on-chain decimals) happens synchronously here
-    so many orders can be evaluated concurrently across threads.
-
-    Returns a fill-params dict if profitable, None if the order should
-    be skipped for any reason (unprofitable, expired, exclusive, or any
-    on-chain call fails).
-
-    Return dict fields:
-        token_in      : str   — address (lowercase)
-        token_out     : str   — address (lowercase)
-        amount_in     : int   — raw units
-        required_out  : int   — current decayed minimum output
-        v3_quote      : int   — what V3 will give us
-        pool_fee      : int   — best V3 fee tier
-        profit_usd    : float — estimated net profit after gas
-        gas_cost_usd  : float — estimated gas cost
-        surplus_usd   : float — gross surplus before gas
-        order_hash    : str
-        encoded_order : str
-        signature     : str
+    Evaluate profitability of a single order.
+    Returns fill-params dict if profitable, None otherwise.
+    Never raises — all errors are caught and return None.
     """
-    # ── Basic field extraction ────────────────────────────────────────────────
-    token_in  = order.get("input",  {}).get("token", "").lower()
-    outputs   = [o for o in order.get("outputs", []) if not o.get("isFeeOutput", False)]
-    if not outputs or not token_in:
-        return None
-
-    primary   = max(outputs, key=lambda x: int(x.get("endAmount", 0)))
-    token_out = primary.get("token", "").lower()
-
-    # Skip native ETH output (zero address) — not an ERC20, cannot approve
-    if token_out == "0x0000000000000000000000000000000000000000":
-        return None
-
-    # ── Deadline check ────────────────────────────────────────────────────────
-    deadline = order.get("deadline", 0)
-    if deadline and int(time.time()) >= deadline:
-        return None
-
-    # ── Exclusivity check ─────────────────────────────────────────────────────
-    cosigner_data    = order.get("cosignerData", {})
-    exclusive_filler = cosigner_data.get(
-        "exclusiveFiller", "0x0000000000000000000000000000000000000000"
-    )
-    decay_start = cosigner_data.get("decayStartTime") or order.get("decayStartTime", 0)
-
-    if (exclusive_filler.lower() not in ("0x0000000000000000000000000000000000000000", "")
-            and int(time.time()) < decay_start):
-        return None  # still in exclusive period
-
-    # ── Amounts ───────────────────────────────────────────────────────────────
-    input_override = cosigner_data.get("inputOverride", "0")
-    if input_override and input_override != "0":
-        amount_in = int(input_override)
-    else:
-        amount_in = int(order.get("input", {}).get("startAmount", 0))
-
-    if amount_in == 0:
-        return None
-
-    required_out = current_required_out(order)
-    if required_out == 0:
-        return None
-
-    # ── V3 quote — raises QuoteError if no pool or all tiers fail ─────────────
     try:
-        v3_quote, pool_fee = quote_v3(w3, token_in, token_out, amount_in)
-    except QuoteError:
-        return None  # no liquidity on any fee tier — skip silently
+        # ── Deadline ─────────────────────────────────────────────────────────
+        deadline = int(order.get("deadline") or 0)
+        if deadline and time.time() >= deadline:
+            return None
 
-    if v3_quote <= required_out:
-        return None  # V3 can't beat required output — no gross surplus
+        # ── Exclusivity ───────────────────────────────────────────────────────
+        cosigner_data    = order.get("cosignerData", {})
+        exclusive_filler = (cosigner_data.get("exclusiveFiller") or "").lower()
+        decay_start      = int(cosigner_data.get("decayStartTime")
+                               or order.get("decayStartTime") or 0)
+        null_addr        = "0x0000000000000000000000000000000000000000"
+        if exclusive_filler not in ("", null_addr) and time.time() < decay_start:
+            return None  # exclusive window, not our order yet
 
-    surplus_raw = v3_quote - required_out
+        # ── Token in ──────────────────────────────────────────────────────────
+        token_in = order.get("input", {}).get("token", "").lower()
+        if not token_in:
+            return None
 
-    # ── Token decimals — raises DecimalsError if on-chain call fails ──────────
-    try:
-        dec_out = get_decimals(w3, token_out)
-    except DecimalsError:
-        return None  # can't price the surplus — skip
+        # ── Skip native ETH output — not ERC20, reactor can't pull it ────────
+        ETH_ADDR = "0x0000000000000000000000000000000000000000"
 
-    surplus_h = surplus_raw / (10 ** dec_out)
+        # ── Required output ───────────────────────────────────────────────────
+        required_out, token_out = current_required_out(order)
+        if token_out == ETH_ADDR:
+            return None
+        if required_out == 0:
+            return None
 
-    # ── Gas cost — raises GasPriceError if node unavailable ──────────────────
-    try:
-        gas_price_wei = get_gas_price(w3)
-    except GasPriceError:
-        return None  # can't determine gas cost — skip to avoid under-priced fills
+        # ── Amount in (with cosigner inputOverride) ───────────────────────────
+        input_override = cosigner_data.get("inputOverride", "0") or "0"
+        amount_in = (int(input_override) if input_override != "0"
+                     else int(order.get("input", {}).get("startAmount", 0)))
+        if amount_in == 0:
+            return None
 
-    gas_cost_eth = (GAS_ESTIMATE * gas_price_wei) / 1e18
-    gas_cost_usd = gas_cost_eth * eth_price
+        # ── V3 quote — concurrent across all fee tiers ────────────────────────
+        v3_quote, pool_fee = quote_best(w3, token_in, token_out, amount_in)
+        if v3_quote == 0 or pool_fee == 0:
+            return None  # no liquidity
 
-    # ── Surplus → USD conversion ──────────────────────────────────────────────
-    USDC = "0xa0b86991c6231488ccd050ce3eba90c95bdc17b4"
-    USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
-    DAI  = "0x6b175474e89094c44da98b954eedeac495271d0f"
-    WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+        if v3_quote <= required_out:
+            return None  # V3 can't beat required output
 
-    if token_out in (USDC, USDT, DAI):
-        # Stablecoins — 1:1 with USD
-        surplus_usd = surplus_h
-    elif token_out == WETH:
-        surplus_usd = surplus_h * eth_price
-    else:
-        # Unknown token — price surplus against USDC via V3
-        # This works for any ERC20 with a USDC pool; raises QuoteError otherwise
-        try:
-            surplus_quote, _ = quote_v3(w3, token_out, USDC, int(surplus_raw))
-        except QuoteError:
-            return None  # can't price this token — skip
-        surplus_usd = surplus_quote / 1e6
+        # ── Surplus ───────────────────────────────────────────────────────────
+        surplus_raw = v3_quote - required_out
+        dec_out     = get_decimals(w3, token_out)
+        surplus_usd = token_to_usd(w3, token_out, surplus_raw, dec_out)
 
-    profit_usd = surplus_usd - gas_cost_usd
+        # ── Gas cost — simulate exact gas via eth_estimateGas ────────────────
+        from config import FILLERBOT_ADDR
+        if not FILLERBOT_ADDR:
+            raise ValueError("FILLERBOT_ADDRESS not set")
 
-    if profit_usd < MIN_PROFIT_USD:
-        return None
+        FILLERBOT_ABI_MIN = [{"inputs":[
+            {"name":"encodedOrder","type":"bytes"},
+            {"name":"sig","type":"bytes"},
+            {"name":"tokenIn","type":"address"},
+            {"name":"tokenOut","type":"address"},
+            {"name":"amountIn","type":"uint256"},
+            {"name":"requiredOut","type":"uint256"},
+            {"name":"poolFee","type":"uint24"}],
+            "name":"fillOrder","outputs":[],
+            "stateMutability":"nonpayable","type":"function"}]
 
-    return {
-        "token_in":      token_in,
-        "token_out":     token_out,
-        "amount_in":     amount_in,
-        "required_out":  required_out,
-        "v3_quote":      v3_quote,
-        "pool_fee":      pool_fee,
-        "profit_usd":    round(profit_usd, 4),
-        "gas_cost_usd":  round(gas_cost_usd, 4),
-        "surplus_usd":   round(surplus_usd, 4),
-        "order_hash":    order.get("orderHash", ""),
-        "encoded_order": order.get("encodedOrder", ""),
-        "signature":     order.get("signature", ""),
-    }
+        contract  = w3.eth.contract(
+            address=Web3.to_checksum_address(FILLERBOT_ADDR),
+            abi=FILLERBOT_ABI_MIN
+        )
+        gas_units = contract.functions.fillOrder(
+            bytes.fromhex(order.get("encodedOrder","").replace("0x","")),
+            bytes.fromhex(order.get("signature","").replace("0x","")),
+            Web3.to_checksum_address(token_in),
+            Web3.to_checksum_address(token_out),
+            amount_in,
+            required_out,
+            pool_fee,
+        ).estimate_gas({"from": account_address()})
+
+        gas_cost_usd = get_gas_price_usd(w3, gas_units)
+
+        # ── Profit check ──────────────────────────────────────────────────────
+        profit_usd = surplus_usd - gas_cost_usd
+        if profit_usd < MIN_PROFIT_USD:
+            return None
+
+        return {
+            "token_in":      token_in,
+            "token_out":     token_out,
+            "amount_in":     amount_in,
+            "required_out":  required_out,
+            "v3_quote":      v3_quote,
+            "pool_fee":      pool_fee,
+            "profit_usd":    round(profit_usd, 4),
+            "gas_cost_usd":  round(gas_cost_usd, 4),
+            "surplus_usd":   round(surplus_usd, 4),
+            "order_hash":    order.get("orderHash", ""),
+            "encoded_order": order.get("encodedOrder", ""),
+            "signature":     order.get("signature", ""),
+        }
+
+    except Exception:
+        return None  # skip this order, log happens in monitor

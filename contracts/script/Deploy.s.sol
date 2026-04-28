@@ -76,9 +76,5 @@ contract Deploy is Script {
         console.log("  3. Set FILLERBOT_ADDRESS env var in your bot");
         console.log("  4. Run bot pointing at this contract");
         console.log("");
-        console.log("OPTIONAL - set minimum profit threshold:");
-        console.log("  bot.setMinProfit(500000000000000)");
-        console.log("  (= 0.0005 ETH ~ $1.50 at $3000/ETH)");
-        console.log("  Keep at 0 during initial testing.");
     }
 }
