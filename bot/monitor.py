@@ -1,12 +1,3 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# monitor.py — main polling loop with concurrent order evaluation
-#
-# USAGE:
-#   export EXECUTOR_PRIVATE_KEY=0x...
-#   export FILLERBOT_ADDRESS=0x...
-#   export IPC_PATH=/bsc/reth/reth.ipc
-#   python3 monitor.py
-# ─────────────────────────────────────────────────────────────────────────────
 import time
 import requests
 from datetime import datetime
@@ -126,12 +117,12 @@ def run_loop(w3: Web3, fill_fn=None, verbose: bool = False):
             log(f"  Evaluated {len(new_orders)} in {eval_ms}ms"
                 f" | profitable={len(profitable)}")
 
-            # Execute profitable orders sorted by profit desc
-            for fill in sorted(profitable, key=lambda x: -x["profit_usd"]):
+            # Execute fillable orders sorted by surplus desc
+            for fill in sorted(profitable, key=lambda x: -x["surplus_raw"]):
                 log(f"  FILL {fill['token_in'][:10]}->{fill['token_out'][:10]}"
-                    f" profit=${fill['profit_usd']:.4f}"
-                    f" surplus=${fill['surplus_usd']:.4f}"
-                    f" gas=${fill['gas_cost_usd']:.4f}"
+                    f" surplus_raw={fill['surplus_raw']}"
+                    f" v3_quote={fill['v3_quote']}"
+                    f" required_out={fill['required_out']}"
                     f" fee={fill['pool_fee']}")
                 try:
                     tx_hash = fill_fn(w3, fill)

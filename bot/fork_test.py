@@ -1,27 +1,3 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# fork_test.py — continuous fork harness
-#
-# USAGE:
-#   # Start anvil fork first:
-#   anvil --fork-url /bsc/reth/reth.ipc --fork-block-number 24974000 --port 8547
-#
-#   # Then run:
-#   export FILLERBOT_ADDRESS=0x659E0981563DF0fE69603c5555Adda9547C36781
-#   export EXECUTOR_PRIVATE_KEY=0x...
-#   python3 fork_test.py
-#
-# WHAT THIS FILE DOES:
-#   1. Connects Web3 to the anvil fork instead of the IPC node
-#   2. Funds the executor wallet on the fork via anvil_setBalance
-#   3. Calls monitor.run_loop() — the exact same loop as production
-#
-# WHAT THIS FILE DOES NOT DO:
-#   - No evaluation logic (that's evaluator.py)
-#   - No order fetching logic (that's monitor.py)
-#   - No execution logic (that's executor.py)
-#   The only fork-specific thing here is the Web3 connection and the
-#   anvil_setBalance call. Everything else is the live production code.
-# ─────────────────────────────────────────────────────────────────────────────
 from web3 import Web3
 from eth_account import Account
 from config  import EXECUTOR_KEY, FILLERBOT_ADDR
