@@ -2,6 +2,11 @@
 # config.py
 # ─────────────────────────────────────────────────────────────────────────────
 import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env from project root (one level up from bot/)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # ── Node ─────────────────────────────────────────────────────────────────────
 IPC_PATH = os.getenv("IPC_PATH", "/bsc/reth/reth.ipc")
@@ -17,7 +22,7 @@ EXECUTOR_KEY   = os.getenv("EXECUTOR_PRIVATE_KEY", "")
 
 # ── UniswapX API ──────────────────────────────────────────────────────────────
 UNISWAPX_API   = "https://api.uniswap.org/v2/orders"
-POLL_INTERVAL  = 0.5    # seconds — Uniswap recommends max 6 rps
+POLL_INTERVAL  = 2    # seconds — Uniswap recommends max 6 rps
 ORDER_LIMIT    = 50
 
 # ── Profitability ─────────────────────────────────────────────────────────────
