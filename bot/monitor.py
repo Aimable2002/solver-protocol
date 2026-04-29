@@ -20,7 +20,7 @@ def log(msg: str):
 def fetch_open_orders() -> list:
     """Fetch open orders from UniswapX API across all supported order types."""
     orders = []
-    for order_type in ("Dutch_V2", "Limit"):
+    for order_type in ("Dutch_V2", "Dutch", "Limit"):
         try:
             r = requests.get(
                 UNISWAPX_API,

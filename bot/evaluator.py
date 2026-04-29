@@ -240,6 +240,11 @@ def evaluate(w3: Web3, order: dict, verbose: bool = False) -> dict | None:
     ETH_ADDR = "0x0000000000000000000000000000000000000000"
 
     try:
+        # ── Age filter — skip stale orders the reactor will reject ──────────
+        created_at = int(order.get("createdAt") or 0)
+        if created_at and time.time() - created_at > 120:
+            return None
+
         # ── Deadline ──────────────────────────────────────────────────────────
         deadline = int(order.get("deadline") or 0)
         if deadline and time.time() >= deadline:
