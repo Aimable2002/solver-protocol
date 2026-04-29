@@ -1,4 +1,5 @@
 import time
+import threading
 import requests
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,40 +44,51 @@ def fetch_open_orders() -> list:
 def evaluate_batch(w3: Web3, orders: list, verbose: bool = False) -> list[dict]:
     """
     Evaluate all orders concurrently.
-    Returns list of profitable fill-param dicts.
-
-    Args:
-        verbose: Passed through to evaluate(). When True each order prints
-                 full math. Fork mode sets this True; production leaves it False.
-                 Note: verbose mode runs sequentially (max_workers=1) so output
-                 lines don't interleave across concurrent threads.
+    Returns list of fill-param dicts where v3_quote > required_out.
     """
     if not orders:
         return []
 
-    profitable = []
-    # Sequential in verbose mode so per-order output doesn't interleave
+    results = []
     workers = 1 if verbose else min(len(orders), 20)
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(evaluate, w3, o, verbose): o for o in orders}
         for fut in as_completed(futures):
             result = fut.result()
             if result is not None:
-                profitable.append(result)
+                results.append(result)
 
-    return profitable
+    return results
+
+
+def _submit_and_watch(w3: Web3, fill: dict, fill_fn, fill_count: list):
+    """
+    Submit a fill and wait for receipt in a background thread.
+    Never blocks the main poll loop.
+    """
+    order_hash = fill.get("order_hash", "?")
+    try:
+        tx_hash = fill_fn(w3, fill)
+        log(f"    tx: {tx_hash}  order={order_hash}")
+        receipt = wait_for_receipt(w3, tx_hash, timeout=60)
+        if receipt and receipt["status"] == 1:
+            fill_count[0] += 1
+            log(f"    FILLED ✓ order={order_hash}"
+                f" gas={receipt['gasUsed']:,}"
+                f" total_fills={fill_count[0]}")
+        elif receipt:
+            log(f"    REVERTED order={order_hash}"
+                f" gas={receipt['gasUsed']:,}")
+        else:
+            log(f"    TIMEOUT order={order_hash} — no receipt in 60s")
+    except Exception as e:
+        log(f"    execute error order={order_hash}: {e}")
 
 
 def run_loop(w3: Web3, fill_fn=None, verbose: bool = False):
     """
     Main polling loop. Runs forever until KeyboardInterrupt.
-
-    Args:
-        w3:      Connected Web3 instance (IPC for prod, HTTP for fork).
-        fill_fn: Optional override for execute_fill — used by fork_test to
-                 redirect execution to anvil. Defaults to the real execute_fill.
-        verbose: If True, prints full math breakdown for every order evaluated.
-                 Fork mode passes True. Production leaves it False.
+    Fill submission and receipt watching are non-blocking — run in background threads.
     """
     if fill_fn is None:
         fill_fn = execute_fill
@@ -86,7 +98,7 @@ def run_loop(w3: Web3, fill_fn=None, verbose: bool = False):
     log("")
 
     seen       = set()
-    fill_count = 0
+    fill_count = [0]   # list so background threads can mutate it
     skip_count = 0
 
     while True:
@@ -109,35 +121,28 @@ def run_loop(w3: Web3, fill_fn=None, verbose: bool = False):
             log(f"Fetched {len(orders)} orders | {len(new_orders)} new")
 
             # Evaluate all new orders concurrently
-            t0          = time.time()
-            profitable  = evaluate_batch(w3, new_orders, verbose=verbose)
-            eval_ms     = int((time.time() - t0) * 1000)
-            skip_count += len(new_orders) - len(profitable)
+            t0         = time.time()
+            fillable   = evaluate_batch(w3, new_orders, verbose=verbose)
+            eval_ms    = int((time.time() - t0) * 1000)
+            skip_count += len(new_orders) - len(fillable)
 
             log(f"  Evaluated {len(new_orders)} in {eval_ms}ms"
-                f" | profitable={len(profitable)}")
+                f" | fillable={len(fillable)}")
 
-            # Execute fillable orders sorted by surplus desc
-            for fill in sorted(profitable, key=lambda x: -x["surplus_raw"]):
-                log(f"  FILL {fill['token_in'][:10]}->{fill['token_out'][:10]} order={fill['order_hash']}"
+            # Submit fills — each in its own background thread, never blocks loop
+            for fill in sorted(fillable, key=lambda x: -x["surplus_raw"]):
+                log(f"  ATTEMPTING {fill['token_in'][:10]}->{fill['token_out'][:10]}"
+                    f" order={fill['order_hash']}"
                     f" surplus_raw={fill['surplus_raw']}"
                     f" v3_quote={fill['v3_quote']}"
                     f" required_out={fill['required_out']}"
                     f" fee={fill['pool_fee']}")
-                try:
-                    tx_hash = fill_fn(w3, fill)
-                    log(f"    tx: {tx_hash}")
-                    receipt = wait_for_receipt(w3, tx_hash, timeout=60)
-                    if receipt and receipt["status"] == 1:
-                        fill_count += 1
-                        log(f"    FILLED ✓ gas={receipt['gasUsed']:,}"
-                            f" total_fills={fill_count}")
-                    elif receipt:
-                        log(f"    REVERTED gas={receipt['gasUsed']:,}")
-                    else:
-                        log(f"    TIMEOUT — no receipt in 60s")
-                except Exception as e:
-                    log(f"    execute error: {e}")
+                t = threading.Thread(
+                    target=_submit_and_watch,
+                    args=(w3, fill, fill_fn, fill_count),
+                    daemon=True,
+                )
+                t.start()
 
             # Bound seen set to avoid unbounded memory growth
             if len(seen) > 10_000:
@@ -145,7 +150,7 @@ def run_loop(w3: Web3, fill_fn=None, verbose: bool = False):
 
         except KeyboardInterrupt:
             log("")
-            log(f"Stopped — fills={fill_count} skipped={skip_count}")
+            log(f"Stopped — fills={fill_count[0]} skipped={skip_count}")
             break
         except Exception as e:
             log(f"Loop error: {e}")
