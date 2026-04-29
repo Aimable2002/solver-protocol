@@ -5,6 +5,10 @@ from web3 import Web3
 from eth_account import Account
 from config import FILLERBOT_ADDR, EXECUTOR_KEY
 
+# Gas ceiling — actual usage reported in receipt. High enough to never
+# run out on a real fill. Unused gas is refunded.
+GAS_CEILING = 500_000
+
 FILLERBOT_ABI = [
     {
         "inputs": [
@@ -44,8 +48,8 @@ FILLERBOT_ABI = [
 def execute_fill(w3: Web3, fill: dict) -> str:
     """
     Submit fillOrder() tx to FillerBot contract.
-    No gas estimation — node determines gas from block limit.
-    Actual gas cost is read from receipt after mining.
+    Gas ceiling is hardcoded — actual gas used is read from receipt.
+    Unused gas is refunded. No estimation needed.
     Uses EIP-1559 fee model (maxFeePerGas + maxPriorityFeePerGas).
     Raises on any failure — caller handles logging.
     """
@@ -60,7 +64,6 @@ def execute_fill(w3: Web3, fill: dict) -> str:
         abi=FILLERBOT_ABI
     )
 
-    # Build call args
     call_args = (
         bytes.fromhex(fill["encoded_order"].replace("0x", "")),
         bytes.fromhex(fill["signature"].replace("0x", "")),
@@ -81,6 +84,7 @@ def execute_fill(w3: Web3, fill: dict) -> str:
 
     tx = contract.functions.fillOrder(*call_args).build_transaction({
         "from":                 account.address,
+        "gas":                  GAS_CEILING,
         "maxFeePerGas":         max_fee,
         "maxPriorityFeePerGas": priority_fee,
         "nonce":                nonce,
