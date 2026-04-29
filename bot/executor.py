@@ -44,7 +44,8 @@ FILLERBOT_ABI = [
 def execute_fill(w3: Web3, fill: dict) -> str:
     """
     Submit fillOrder() tx to FillerBot contract.
-    Uses eth_estimateGas for exact gas limit.
+    No gas estimation — node determines gas from block limit.
+    Actual gas cost is read from receipt after mining.
     Uses EIP-1559 fee model (maxFeePerGas + maxPriorityFeePerGas).
     Raises on any failure — caller handles logging.
     """
@@ -52,8 +53,6 @@ def execute_fill(w3: Web3, fill: dict) -> str:
         raise ValueError("EXECUTOR_PRIVATE_KEY not set")
     if not FILLERBOT_ADDR:
         raise ValueError("FILLERBOT_ADDRESS not set")
-
-    order_hash = fill.get("order_hash", "?")
 
     account  = Account.from_key(EXECUTOR_KEY)
     contract = w3.eth.contract(
@@ -78,21 +77,10 @@ def execute_fill(w3: Web3, fill: dict) -> str:
     priority_fee = w3.eth.max_priority_fee
     max_fee      = (2 * base_fee) + priority_fee
 
-    # ── Exact gas estimate from node ──────────────────────────────────────────
-    try:
-        gas_limit = contract.functions.fillOrder(*call_args).estimate_gas({
-            "from": account.address,
-        })
-    except Exception as e:
-        raise RuntimeError(
-            f"estimate_gas failed order={order_hash}: {e}"
-        ) from e
-
     nonce = w3.eth.get_transaction_count(account.address)
 
     tx = contract.functions.fillOrder(*call_args).build_transaction({
         "from":                 account.address,
-        "gas":                  gas_limit,
         "maxFeePerGas":         max_fee,
         "maxPriorityFeePerGas": priority_fee,
         "nonce":                nonce,

@@ -7,15 +7,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from web3 import Web3
 
-from eth_account import Account
 from config import (
-    QUOTER_V2, FEE_TIERS, DECIMALS, EXECUTOR_KEY, FILLERBOT_ADDR,
+    QUOTER_V2, FEE_TIERS, DECIMALS,
 )
 
 
-def account_address() -> str:
-    """Return executor wallet address for gas estimation calls."""
-    return Account.from_key(EXECUTOR_KEY).address
 
 
 # ── ABIs ──────────────────────────────────────────────────────────────────────
@@ -47,16 +43,6 @@ ERC20_ABI = [
      "stateMutability": "view", "type": "function"},
 ]
 
-FILLERBOT_ABI_MIN = [{"inputs": [
-    {"name": "encodedOrder", "type": "bytes"},
-    {"name": "sig",          "type": "bytes"},
-    {"name": "tokenIn",      "type": "address"},
-    {"name": "tokenOut",     "type": "address"},
-    {"name": "amountIn",     "type": "uint256"},
-    {"name": "requiredOut",  "type": "uint256"},
-    {"name": "poolFee",      "type": "uint24"}],
-    "name": "fillOrder", "outputs": [],
-    "stateMutability": "nonpayable", "type": "function"}]
 
 # ── Decimals + symbol cache (shared across threads) ───────────────────────────
 _dec_lock = threading.Lock()
@@ -321,28 +307,6 @@ def evaluate(w3: Web3, order: dict, verbose: bool = False) -> dict | None:
             if verbose:
                 print(f"    SKIP v3_quote does not beat required_out", flush=True)
             return None
-
-        # ── Gas estimate — logged only, never blocks ───────────────────────────
-        if FILLERBOT_ADDR:
-            try:
-                contract  = w3.eth.contract(
-                    address=Web3.to_checksum_address(FILLERBOT_ADDR),
-                    abi=FILLERBOT_ABI_MIN,
-                )
-                gas_units = contract.functions.fillOrder(
-                    bytes.fromhex(order.get("encodedOrder", "").replace("0x", "")),
-                    bytes.fromhex(order.get("signature",     "").replace("0x", "")),
-                    Web3.to_checksum_address(token_in),
-                    Web3.to_checksum_address(token_out),
-                    amount_in,
-                    required_out,
-                    pool_fee,
-                ).estimate_gas({"from": account_address()})
-                if verbose:
-                    print(f"    gas_units:    {gas_units:,}", flush=True)
-            except Exception as e:
-                if verbose:
-                    print(f"    gas estimate failed (non-blocking): {e}", flush=True)
 
         if verbose:
             print(f"    ✓ FILLING", flush=True)
